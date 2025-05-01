@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+#
+# This file is part of the Robotic Observatory Control Kit (rockit)
+#
+# rockit is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rockit is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rockit.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling the Marsh Observatory heliostat"""
+import argparse
+import re
+import sys
+import threading
+import traceback
+import psutil
+from astropy.coordinates import EarthLocation, get_body, HADec
+from astropy.time import Time
+import astropy.units as u
+import numpy as np
+import Pyro4
+from rockit.common import log, TryLock
+from rockit.common.helpers import pyro_client_matches
+from rockit.klippermcu import MCU, NeoPixel, OutputPin, TMCUART, Stepper, StepperStatus
+from rockit.mount.heliostat import CommandStatus, Config, MountStatus
+
+class StepperWrapper:
+    def __init__(self, mcu, interfaces, config):
+        interface = config.pop('interface', None)
+
+        uart = interfaces[interface] if interfaces else None
+        self.stepper = Stepper(mcu, uart, **config)
+        self.command_lock = threading.Lock()
+        self.set_pos = 0
+
+class HeliostatDaemon:
+    """Daemon interface for multi-channel mount"""
+    def __init__(self, config):
+        self._config = config
+        self._location = EarthLocation(
+            lat=config.latitude*u.deg,
+            lon=config.longitude*u.deg,
+            height=config.altitude*u.m)
+
+        # Takes priority over target_ha, target_dec
+        self._target_body = None
+        self._target_ha = 0
+        self._target_dec = 0
+
+        self._ha_offset = 0
+        self._dec_offset = 0
+        self._is_homing = False
+        self._is_stopping = False
+
+        self._pointing_command_lock = threading.Lock()
+        self._focus_command_lock = threading.Lock()
+        self._mcu = MCU(config.serial_port, config.serial_baud)
+
+        self._neopixel = self._color_regex = None
+        self._neopixel_lock = threading.Lock()
+
+        if config.neopixel:
+            self._color_regex = re.compile('^([0-9A-Fa-f]{6})$')
+            self._neopixel = NeoPixel(self._mcu, config.neopixel['pin'], config.neopixel['count'])
+
+        interfaces = {}
+        for k, v in config.interfaces.items():
+            if v['type'] == 'tmc2209':
+                interfaces[k] = TMCUART(self._mcu, v['type'], v.get('tx_pin', v['uart_pin']), v['uart_pin'])
+
+        self._ha_stepper = StepperWrapper(self._mcu, interfaces, config.ha_stepper)
+        self._dec_stepper = StepperWrapper(self._mcu, interfaces, config.dec_stepper)
+        self._focus_stepper = StepperWrapper(self._mcu, interfaces, config.focus_stepper)
+        self._steppers = {
+            'ha': self._ha_stepper,
+            'dec': self._dec_stepper,
+            'focus': self._focus_stepper
+        }
+
+        self._controller_fan = None
+        if config.controller_fan:
+            self._controller_fan = OutputPin(self._mcu, config.controller_fan['pin'])
+            threading.Thread(target=self._fan_thread).start()
+
+    def _fan_thread(self):
+        cond = threading.Condition()
+        active_states = [StepperStatus.Moving, StepperStatus.Homing, StepperStatus.Tracking]
+        disable_time = self._mcu.host_clock()
+        idle_timeout = self._config.controller_fan['idle_timeout']
+        enabled = False
+
+        while True:
+            stepper_active = any(c.stepper.status in active_states for c in self._steppers.values())
+            if stepper_active:
+                disable_time = self._mcu.host_clock() + idle_timeout
+
+            next_enabled = self._mcu.host_clock() < disable_time
+            if next_enabled != enabled:
+                self._controller_fan.set(next_enabled)
+                enabled = next_enabled
+
+            with cond:
+                cond.wait(1)
+
+    @Pyro4.expose
+    def home(self):
+        """Connects to the device"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as command_success:
+            with TryLock(self._focus_command_lock) as focus_success:
+                if not command_success or not focus_success:
+                    return CommandStatus.Blocked
+
+                if not self._mcu.connected:
+                    return CommandStatus.NotConnected
+
+                self._is_homing = True
+                locks = []
+                try:
+                    for c in self._steppers.values():
+                        if c.stepper.has_endstop:
+                            if not c.command_lock.acquire(False):
+                                return CommandStatus.Blocked
+
+                            locks.append(c.command_lock)
+                            c.stepper.home(blocking=False)
+
+                    def wait_until_complete(status, timeout):
+                        cond = threading.Condition()
+                        start = self._mcu.host_clock()
+                        while True:
+                            if self._mcu.host_clock() - start > timeout:
+                                return
+
+                            if all(c.stepper.status != status for c in self._steppers.values()):
+                                print(c.stepper.status for c in self._steppers.values())
+                                break
+
+                            with cond:
+                                cond.wait(0.1)
+
+                    wait_until_complete(StepperStatus.Homing, self._config.home_timeout)
+                    if any(c.stepper.status in [StepperStatus.NotHomed, StepperStatus.Homing]
+                           for c in self._steppers.values()):
+                        return CommandStatus.Failed
+
+                    log.info(self._config.log_name, 'Homing complete')
+                    return CommandStatus.Succeeded
+
+                except Exception:
+                    print('error while homing')
+                    traceback.print_exc(file=sys.stdout)
+                    return CommandStatus.Failed
+                finally:
+                    for lock in locks:
+                        lock.release()
+                    self._is_homing = False
+
+
+    @Pyro4.expose
+    def offset(self, ha_delta_deg, dec_delta_deg):
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if not self._mcu.connected:
+                return CommandStatus.NotConnected
+
+            self._ha_offset += ha_delta_deg
+            self._dec_offset += dec_delta_deg
+            if not self._target_body:
+                hs = self._ha_stepper.stepper
+                ds = self._dec_stepper.stepper
+                hs.move(ha_delta_deg, False)
+                ds.move(dec_delta_deg, False)
+                cond = threading.Condition()
+                while StepperStatus.Moving in [hs.status, ds.status]:
+                    with cond:
+                        cond.wait(0.1)
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def slew_hadec(self, ha_deg, dec_deg):
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if not self._mcu.connected:
+                return CommandStatus.NotConnected
+
+            hs = self._ha_stepper.stepper
+            ds = self._dec_stepper.stepper
+
+            hs.stop()
+            ds.stop()
+
+            self._target_body = None
+            self._target_ha = ha_deg
+            self._target_dec = dec_deg
+            self._ha_offset = self._dec_offset = 0
+
+            hs.move(self._target_ha - hs.position, False)
+            ds.move(self._target_dec - ds.position, False)
+
+            cond = threading.Condition()
+            while StepperStatus.Moving in [hs.status, ds.status]:
+                with cond:
+                    cond.wait(0.1)
+
+            if hs.status != StepperStatus.Idle or hs.status != StepperStatus.Idle:
+                return CommandStatus.Failed
+
+            return CommandStatus.Succeeded
+
+
+    @Pyro4.expose
+    def track_body(self, body):
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if not self._mcu.connected:
+                return CommandStatus.NotConnected
+
+            self._target_body = body
+            self._target_ha = self._target_dec = None
+
+            # Generate a track spanning the next 24h - guarantees we will hit a limit before running out of track
+            t_origin = psutil.boot_time()
+            track_t = self._mcu.host_clock() + np.arange(0, 86400, 600)
+            ta = Time(t_origin + track_t, format='unix', location=self._location)
+            coords = get_body(self._target_body, ta).transform_to(HADec(obstime=ta, location=self._location))
+            track_ha = coords.ha.to_value(u.deg)
+            track_dec = coords.dec.to_value(u.deg)
+
+            def ha_func(t):
+                return np.interp(t, track_t, track_ha) + self._ha_offset
+
+            def dec_func(t):
+                return np.interp(t, track_t, track_dec) + self._dec_offset
+
+            # Roughly acquire target before starting to track
+            target_ha = ha_func(self._mcu.host_clock()) + self._ha_offset
+            target_dec = dec_func(self._mcu.host_clock()) + self._dec_offset
+            print(f'Slewing to {target_ha:.3f}, {target_dec:.3f}')
+
+            hs = self._ha_stepper.stepper
+            ds = self._dec_stepper.stepper
+            if self._is_stopping:
+                return CommandStatus.Failed
+
+            hs.move(target_ha - hs.position, False)
+            ds.move(target_dec - ds.position, False)
+
+            if self._is_stopping:
+                hs.stop()
+                ds.stop()
+                return CommandStatus.Failed
+
+            cond = threading.Condition()
+            while StepperStatus.Moving in [hs.status, ds.status]:
+                with cond:
+                    cond.wait(0.1)
+
+            if self._is_stopping:
+                return CommandStatus.Failed
+
+            self._ha_stepper.stepper.track(ha_func)
+            self._dec_stepper.stepper.track(dec_func)
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_focus(self, position):
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._focus_command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if not self._mcu.connected:
+                return CommandStatus.NotConnected
+
+            if self._focus_stepper.stepper.status == StepperStatus.NotHomed:
+                return CommandStatus.StepperNotHomed
+
+            self._focus_stepper.set_pos = position
+            self._focus_stepper.stepper.move(self._focus_stepper.set_pos - self._focus_stepper.stepper.position)
+            if abs(self._focus_stepper.set_pos - self._focus_stepper.stepper.position) > 0.001:
+                self._focus_stepper.set_pos = self._focus_stepper.stepper.position
+                return CommandStatus.Failed
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def stop(self):
+        """Stops any active telescope movement"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        try:
+            self._is_stopping = True
+            self._ha_stepper.stepper.stop(blocking=False)
+            self._dec_stepper.stepper.stop(blocking=False)
+
+            # Block until any other pointing commands have terminated
+            with self._pointing_command_lock:
+                return CommandStatus.Succeeded
+        finally:
+            self._is_stopping = False
+
+    @Pyro4.expose
+    def stop_focus(self):
+        """Stops any active focuser movement"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        self._focus_stepper.stepper.stop(blocking=True)
+
+        # Block until any other pointing commands have terminated
+        with self._focus_command_lock:
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current mount state"""
+        s = MountStatus.Disconnected
+        if self._mcu.connected:
+            s = MountStatus.Homing if self._is_homing else MountStatus.Connected
+
+        data = {
+            'date': Time.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'status': s,
+            'status_label': MountStatus.label(s, formatting=False),
+        }
+
+        if s != MountStatus.Disconnected:
+            if self._neopixel:
+                data['neopixel'] = self._neopixel.color
+
+            for key, s in self._steppers.items():
+                status = s.stepper.status
+                data[key] = {
+                    'status': status,
+                    'status_label': StepperStatus.label(status, formatting=False),
+                }
+                if status >= StepperStatus.Idle:
+                    data[key]['pos'] = s.stepper.position
+
+                if key == 'focus':
+                    data[key]['set_pos'] = s.set_pos
+
+        return data
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connects to the device"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as command_success:
+            with TryLock(self._focus_command_lock) as focus_success:
+                if not command_success or not focus_success:
+                    return CommandStatus.Blocked
+
+                if self._mcu.connected:
+                    return CommandStatus.NotDisconnected
+
+                try:
+                    if not self._mcu.initialize():
+                        return CommandStatus.Failed
+
+                    self._target_ha = 0
+                    self._target_dec = 0
+                    self._target_body = None
+
+                    self._ha_offset = 0
+                    self._dec_offset = 0
+
+                    log.info(self._config.log_name, 'Connected to controller')
+                    return CommandStatus.Succeeded
+
+                except Exception:
+                    print('error while initializing mount')
+                    traceback.print_exc(file=sys.stdout)
+                    return CommandStatus.Failed
+
+    @Pyro4.expose
+    def set_light(self, color):
+        """Change the color of an attached NeoPixel light strip"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._neopixel_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if not self._mcu.connected:
+                return CommandStatus.NotConnected
+
+            if not self._neopixel:
+                return CommandStatus.NoLights
+
+            if not self._color_regex.match(color):
+                return CommandStatus.InvalidLightColor
+
+            if not self._neopixel.set_color(color):
+                return CommandStatus.Failed
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disconnects from the device"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._pointing_command_lock) as command_success:
+            with TryLock(self._focus_command_lock) as focus_success:
+                if not command_success or not focus_success:
+                    return CommandStatus.Blocked
+
+                if not self._mcu.connected:
+                    return CommandStatus.NotConnected
+
+                try:
+                    if not self._mcu.shutdown():
+                        return CommandStatus.Failed
+                    log.info(self._config.log_name, 'Disconnected from controller')
+                    return CommandStatus.Succeeded
+                except Exception:
+                    print('error while shutting down mount')
+                    traceback.print_exc(file=sys.stdout)
+                    return CommandStatus.Failed
+
+    @Pyro4.expose
+    def ping(self):
+        """Returns immediately with a success status"""
+        return CommandStatus.Succeeded
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Heliostat Server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+    _config = Config(args.config)
+    _config.daemon.launch(HeliostatDaemon(_config))
