@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+#
+# This file is part of the Robotic Observatory Control Kit (rockit)
+#
+# rockit is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rockit is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rockit.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Commandline client for managing the telescope"""
+
+import glob
+import os
+import sys
+import Pyro4
+from astropy.coordinates import Angle, SkyCoord
+import astropy.units as u
+from rockit.mount.heliostat import CommandStatus, Config
+from rockit.common import print
+
+SCRIPT_NAME = os.path.basename(sys.argv[0])
+
+sys.excepthook = Pyro4.util.excepthook
+
+
+def run_command(command, args):
+    """Runs a daemon command, handling cancellation and error messages"""
+    if 'MOUNTD_CONFIG_PATH' in os.environ:
+        config = Config(os.environ['MOUNTD_CONFIG_PATH'])
+    else:
+        # Load the config file defined in the MOUNTD_CONFIG_PATH environment variable or from the
+        # default system location (/etc/mountd/). Exit with an error if zero or multiple are found.
+        files = glob.glob("/etc/mountd/*.json")
+        if len(files) != 1:
+            print('error: failed to guess the default config file. ' +
+                  'Run as MOUNTD_CONFIG_PATH=/path/to/config.json tel <command> \\[<args>]')
+            return 1
+
+        config = Config(files[0])
+
+    try:
+        ret = command(config, args)
+    except KeyboardInterrupt:
+        # ctrl-c terminates the running command
+        # pylint: disable=comparison-with-callable
+        if command != status:
+            ret = stop(config, args)
+        # pylint: enable=comparison-with-callable
+
+        # Report successful stop
+        if ret == 0:
+            ret = -100
+    except Pyro4.errors.CommunicationError:
+        ret = -101
+
+    # Print message associated with error codes, except for -1 (error handled locally)
+    if ret not in (0, -1):
+        print(CommandStatus.message(ret))
+    return ret
+
+
+def offset(config, args):
+    """Offsets the telescope by a specified delta RA,Dec"""
+    if len(args) != 2:
+        print(f'usage: {SCRIPT_NAME} offset <HH:MM:SS.S> <DD:MM:SS.S>')
+        return -1
+
+    try:
+        offset_ra = Angle(args[0], unit=u.deg)
+    except ValueError:
+        print(f'error: failed to parse \'{args[0]}\' as a DD:MM:SS.S right ascension.')
+        return -1
+
+    try:
+        offset_dec = Angle(args[1], unit=u.deg)
+    except ValueError:
+        print(f'error: failed to parse \'{args[1]}\' as a DD:MM:SS.S declination.')
+        return -1
+
+    ping_daemon(config)
+    with config.daemon.connect(timeout=0) as daemon:
+        return daemon.offset(offset_ra.to_value(u.deg), offset_dec.to_value(u.deg))
+
+
+def focus(config, args):
+    """Sets the focus position"""
+    if len(args) != 1:
+        print(f'usage: {SCRIPT_NAME} focus <pos>')
+        return -1
+
+    try:
+        position = float(args[0])
+    except ValueError:
+        print(f'error: failed to parse \'{args[0]}\' as a number.')
+        return -1
+
+    ping_daemon(config)
+
+    with config.daemon.connect(timeout=0) as daemon:
+        try:
+            return daemon.set_focus(position)
+        except KeyboardInterrupt:
+            return daemon.stop_focus()
+
+
+
+def track(config, args):
+    valid_bodies = ["sun", "moon"]
+    if len(args) != 1 or args[0] not in valid_bodies:
+        print(f'usage: {SCRIPT_NAME} track ({"|".join(valid_bodies)})')
+        return -1
+
+    ping_daemon(config)
+    with config.daemon.connect(timeout=0) as daemon:
+        return daemon.track_body(args[0])
+
+
+def slew(config, args):
+    if len(args) != 2:
+        print(f'usage: {SCRIPT_NAME} slew <ha> <dec>')
+        return -1
+
+    try:
+        ha = float(args[0])
+        dec = float(args[1])
+    except ValueError:
+        print(f'usage: {SCRIPT_NAME} slew <ha> <dec>)')
+        return -1
+
+
+    ping_daemon(config)
+    with config.daemon.connect(timeout=0) as daemon:
+        return daemon.slew_hadec(ha, dec)
+
+
+def status(config, _):
+    """Reports the current mount status"""
+    with config.daemon.connect() as daemon:
+        data = daemon.report_status()
+
+    if data is None:
+        return 1
+
+    print(data)
+    return 0
+    #print(f'   Telescope is {MountState.label(data["state"], formatting=True)}')
+    #if data['state'] in [MountState.Disabled, MountState.NotHomed, MountState.Homing]:
+    #    return 0
+
+    coords = SkyCoord(ra=data['ra'], dec=data['dec'], unit=u.deg)
+    ra_desc = coords.ra.to(u.hourangle).to_string(sep=':', precision=2)
+    dec_desc = coords.dec.to(u.deg).to_string(sep=':', precision=2)
+
+    altaz = SkyCoord(alt=data['alt'], az=data['az'], unit=u.deg, frame='altaz')
+    alt_desc = altaz.alt.to(u.deg).to_string(sep=':', precision=2)
+    az_desc = altaz.az.to_string(sep=':', precision=2)
+
+    ra_offset_desc = ''
+    ra_offset = Angle(data['offset_ra'], unit=u.deg).to(u.hourangle)
+    if ra_offset != 0:
+        ra_offset_desc = f' with offset [b]{ra_offset.to_string(sep=":", precision=2)}[/b]'
+
+    dec_offset_desc = ''
+    dec_offset = Angle(data['offset_dec'], unit=u.deg)
+    if dec_offset != 0:
+        dec_offset_desc = f' with offset [b]{dec_offset.to_string(sep=":", precision=2)}[/b]'
+
+    print(f'   RA is [b]{ra_desc}[/b]' + ra_offset_desc)
+    print(f'   Dec is [b]{dec_desc}[/b]' + dec_offset_desc)
+    print(f'   Altitude is [b]{alt_desc}[/b]')
+    print(f'   Azimuth is [b]{az_desc}[/b]')
+    print(f'   Moon separation is [b]{data["moon_separation"]:.0f}\u00B0[/b]')
+    print(f'   Sun separation is [b]{data["sun_separation"]:.0f}\u00B0[/b]')
+
+    lst_desc = Angle(data['lst'], unit=u.deg).to(u.hourangle).to_string(sep=':', precision=2)
+    print(f'   Local sidereal time is [b]{lst_desc}[/b]')
+
+    return 0
+
+
+def stop(config, _):
+    """Stops any active mount movement"""
+    with config.daemon.connect() as daemon:
+        return daemon.stop()
+
+
+def initialize(config, _):
+    """Connect to mount and enable motor power"""
+    with config.daemon.connect() as daemon:
+        return daemon.initialize()
+
+
+def home(config, *_):
+    """Home focus channels that have end stops"""
+    try:
+        with config.daemon.connect(timeout=config.home_timeout + config.move_timeout) as daemon:
+            return daemon.home()
+    except KeyboardInterrupt:
+        # ctrl-c terminates the running command
+        with config.daemon.connect() as daemon:
+            daemon.stop_focus()
+            return daemon.stop()
+
+
+def light(config, args):
+    """Toggle lights or set color"""
+    if len(args) == 1:
+        color = args[0]
+        if args[0] == 'on':
+            color = 'FFFFFF'
+        elif args[0] == 'off':
+            color = '000000'
+
+        with config.daemon.connect() as daemon:
+            return daemon.set_light(color)
+
+    print(f'usage: {SCRIPT_NAME} light (on|off|RRGGBB)')
+    return -1
+
+def shutdown(config, _):
+    """Disable motor power and disconnect from mount"""
+    with config.daemon.connect() as daemon:
+        return daemon.shutdown()
+
+
+def ping_daemon(config):
+    """Check that the daemon is alive before calling a long-timeout method"""
+    with config.daemon.connect() as daemon:
+        daemon.ping()
+
+
+def print_usage():
+    """Prints the utility help"""
+    print(f'usage: {SCRIPT_NAME} <command> \\[<args>]')
+    print()
+    print('general commands:')
+    print('   status    print a human-readable summary of the telescope status')
+    print()
+    print('observing commands:')
+    print('   track     slew the telescope to a given J2000 RA, Dec and track the target')
+    print('   offset    offset the telescope by a given RA, Dec')
+    print('   stop      immediately stop any mount movement')
+    print()
+    print('engineering commands:')
+    print('   init      connect to mount and enable motor power')
+    print('   home      find the mount home position')
+    print('   kill      disable motor power and disconnect from mount')
+    print()
+
+    return 0
+
+
+if __name__ == '__main__':
+    commands = {
+        'track': track,
+        'slew': slew,
+        'offset': offset,
+        'focus': focus,
+        'status': status,
+        'stop': stop,
+        'init': initialize,
+        'home': home,
+        'light': light,
+        'kill': shutdown,
+    }
+
+    if len(sys.argv) >= 2 and sys.argv[1] in commands:
+        sys.exit(run_command(commands[sys.argv[1]], sys.argv[2:]))
+
+    sys.exit(print_usage())

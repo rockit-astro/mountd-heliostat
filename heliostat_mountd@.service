@@ -1,0 +1,13 @@
+[Unit]
+Description=Daemon for controlling heliostat.
+After=syslog.target
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=on-failure
+Type=simple
+ExecStart=/usr/bin/env python3 -u /usr/bin/heliostat_mountd /etc/mountd/%i.json
+
+[Install]
+WantedBy=multi-user.target
