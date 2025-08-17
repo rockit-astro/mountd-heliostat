@@ -22,7 +22,7 @@ import sys
 import threading
 import traceback
 import psutil
-from astropy.coordinates import EarthLocation, get_body, HADec
+from astropy.coordinates import AltAz, EarthLocation, get_body, HADec, SkyCoord
 from astropy.time import Time
 import astropy.units as u
 import numpy as np
@@ -235,6 +235,14 @@ class HeliostatDaemon:
             if not success:
                 return CommandStatus.Blocked
 
+            if self._config.dome_daemon:
+                try:
+                    with self._config.dome_daemon.connect() as dome:
+                        dome.notify_telescope_parked()
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
+
             return self.__point(park['ha'], park['dec'])
 
     @Pyro4.expose
@@ -245,6 +253,17 @@ class HeliostatDaemon:
         with TryLock(self._pointing_command_lock) as success:
             if not success:
                 return CommandStatus.Blocked
+
+            if self._config.dome_daemon:
+                coords = SkyCoord(ha=ha_deg, dec=dec_deg, unit=u.deg,
+                                  location=self._location, obstime=Time.now(),
+                                  frame='hadec').transform_to(AltAz())
+                try:
+                    with self._config.dome_daemon.connect() as dome:
+                        dome.notify_telescope_target_altaz(coords.alt.to_value(u.deg), coords.az.to_value(u.deg))
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
 
             return self.__point(ha_deg, dec_deg)
 
@@ -263,6 +282,14 @@ class HeliostatDaemon:
 
             self._target_body = body
             self._target_ha = self._target_dec = None
+
+            if self._config.dome_daemon:
+                try:
+                    with self._config.dome_daemon.connect() as dome:
+                        dome.notify_telescope_target_body(body)
+                except Exception as e:
+                    log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                    sys.stdout.flush()
 
             # Generate a track spanning the next 24h - guarantees we will hit a limit before running out of track
             t_origin = psutil.boot_time()
@@ -338,6 +365,13 @@ class HeliostatDaemon:
         if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
+        if self._config.dome_daemon:
+            try:
+                with self._config.dome_daemon.connect() as dome:
+                    dome.notify_telescope_target_cleared()
+            except Exception as e:
+                log.error(self._config.log_name, 'Failed to notify dome daemon (' + str(e) + ')')
+                sys.stdout.flush()
         try:
             self._is_stopping = True
             self._ha_stepper.stepper.stop(blocking=False)

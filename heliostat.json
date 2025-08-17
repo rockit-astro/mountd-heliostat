@@ -2,6 +2,7 @@
   "daemon": "warwick_heliostat_mount",
   "log_name": "mountd@heliostat",
   "control_machines": ["WarwickTCS", "WarwickHeliostatDome"],
+  "dome_daemon": "warwick_heliostat_dome",
   "serial_port": "/dev/serial/by-id/usb-Klipper_rp2040_5044340310254C1C-if00",
   "serial_baud": 250000,
   "latitude": 52.376861,

@@ -23,7 +23,7 @@ from rockit.klippermcu.schema import gpio_schema, interfaces_schema, neopixel_sc
 CONFIG_SCHEMA = {
     'type': 'object',
     'additionalProperties': False,
-    'required': ['daemon', 'log_name', 'control_machines',
+    'required': ['daemon', 'log_name', 'control_machines', 'dome_daemon',
                  'serial_port', 'serial_baud',
                  'latitude', 'longitude', 'altitude',
                  'connect_timeout', 'move_timeout', 'home_timeout',
@@ -42,6 +42,10 @@ CONFIG_SCHEMA = {
                 'type': 'string',
                 'machine_name': True
             }
+        },
+        'dome_daemon': {
+            'type': 'string',
+            'daemon_name': True
         },
         'serial_port': {
             'type': 'string',
@@ -125,6 +129,11 @@ class Config:
         self.daemon = getattr(daemons, config_json['daemon'])
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
+
+        self.dome_daemon = None
+        if 'dome_daemon' in config_json:
+            self.dome_daemon = getattr(daemons, config_json['dome_daemon'])
+
         self.serial_port = config_json['serial_port']
         self.serial_baud = int(config_json['serial_baud'])
         self.latitude = float(config_json['latitude'])
