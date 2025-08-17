@@ -193,6 +193,50 @@ class HeliostatDaemon:
 
             return CommandStatus.Succeeded
 
+    def __point(self, ha_deg, dec_deg):
+        if not self._mcu.connected:
+            return CommandStatus.NotConnected
+
+        hs = self._ha_stepper.stepper
+        ds = self._dec_stepper.stepper
+
+        hs.stop()
+        ds.stop()
+
+        self._target_body = None
+        self._target_ha = ha_deg
+        self._target_dec = dec_deg
+        self._ha_offset = self._dec_offset = 0
+
+        hs.move(self._target_ha - hs.position, False)
+        ds.move(self._target_dec - ds.position, False)
+
+        cond = threading.Condition()
+        while StepperStatus.Moving in [hs.status, ds.status]:
+            with cond:
+                cond.wait(0.1)
+
+        if hs.status != StepperStatus.Idle or hs.status != StepperStatus.Idle:
+            return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def park(self, position):
+        """Moves the telescope to a named park position (but does not disconnect)"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        park = self._config.park_positions.get(position, None)
+        if park is None:
+            return CommandStatus.UnknownParkPosition
+
+        with TryLock(self._pointing_command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            return self.__point(park['ha'], park['dec'])
+
     @Pyro4.expose
     def slew_hadec(self, ha_deg, dec_deg):
         if not pyro_client_matches(self._config.control_ips):
@@ -202,32 +246,7 @@ class HeliostatDaemon:
             if not success:
                 return CommandStatus.Blocked
 
-            if not self._mcu.connected:
-                return CommandStatus.NotConnected
-
-            hs = self._ha_stepper.stepper
-            ds = self._dec_stepper.stepper
-
-            hs.stop()
-            ds.stop()
-
-            self._target_body = None
-            self._target_ha = ha_deg
-            self._target_dec = dec_deg
-            self._ha_offset = self._dec_offset = 0
-
-            hs.move(self._target_ha - hs.position, False)
-            ds.move(self._target_dec - ds.position, False)
-
-            cond = threading.Condition()
-            while StepperStatus.Moving in [hs.status, ds.status]:
-                with cond:
-                    cond.wait(0.1)
-
-            if hs.status != StepperStatus.Idle or hs.status != StepperStatus.Idle:
-                return CommandStatus.Failed
-
-            return CommandStatus.Succeeded
+            return self.__point(ha_deg, dec_deg)
 
 
     @Pyro4.expose

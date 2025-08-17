@@ -32,6 +32,7 @@ class CommandStatus:
     NotDisconnected = 8
     NoLights = 9
     InvalidLightColor = 10
+    UnknownParkPosition = 15
 
     _messages = {
         # General error codes
@@ -45,6 +46,7 @@ class CommandStatus:
         8: 'error: controller is already connected',
         9: 'error: lights are not available',
         10: 'error: invalid light color',
+        15: 'error: unknown park position',
 
         -100: 'error: terminated by user',
         -101: 'error: unable to communicate with heliostat daemon',

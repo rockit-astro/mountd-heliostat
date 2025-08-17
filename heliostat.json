@@ -84,5 +84,17 @@
     "uart_address": 1,
     "uart_microsteps": 16,
     "uart_run_current": 0.8
+  },
+  "park_positions": {
+    "zenith": {
+      "desc": "pointing directly up",
+      "ha": 0,
+      "dec": 52.4
+    },
+    "stow": {
+      "desc": "positioned near the home markers",
+      "ha": -85,
+      "dec": -30
+    }
   }
 }

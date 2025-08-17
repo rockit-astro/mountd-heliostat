@@ -27,7 +27,7 @@ CONFIG_SCHEMA = {
                  'serial_port', 'serial_baud',
                  'latitude', 'longitude', 'altitude',
                  'connect_timeout', 'move_timeout', 'home_timeout',
-                 'ha', 'dec', 'focus'],
+                 'ha', 'dec', 'focus', 'park_positions'],
     'properties': {
         'daemon': {
             'type': 'string',
@@ -82,7 +82,30 @@ CONFIG_SCHEMA = {
         'interfaces': interfaces_schema(tmc2209=True),
         'ha': stepper_schema(require_uart=True, require_endstop=True, require_tracking=True),
         'dec': stepper_schema(require_uart=True, require_endstop=True, require_tracking=True),
-        'focus': stepper_schema(require_uart=True, require_endstop=True, require_tracking=True)
+        'focus': stepper_schema(require_uart=True, require_endstop=True, require_tracking=True),
+        'park_positions': {
+            'type': 'object',
+            'additionalProperties': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['desc', 'ha', 'dec'],
+                'properties': {
+                    'desc': {
+                        'type': 'string',
+                    },
+                    'ha': {
+                        'type': 'number',
+                        'min': -90,
+                        'max': 90
+                    },
+                    'dec': {
+                        'type': 'number',
+                        'min': -30,
+                        'max': 90
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -116,3 +139,4 @@ class Config:
         self.ha_stepper = config_json['ha']
         self.dec_stepper = config_json['dec']
         self.focus_stepper = config_json['focus']
+        self.park_positions = config_json['park_positions']

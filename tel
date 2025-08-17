@@ -141,6 +141,25 @@ def slew(config, args):
         return daemon.slew_hadec(ha, dec)
 
 
+def park(config, args):
+    """Slews the telescope to a named park position"""
+    if len(args) == 1:
+        if args[0] not in config.park_positions:
+            print('error: unknown park position \'' + args[0] + '\'')
+            return -1
+
+        ping_daemon(config)
+        with config.daemon.connect(timeout=0) as daemon:
+            return daemon.park(args[0])
+
+    print(f'usage: {SCRIPT_NAME} park <position>')
+    print()
+    for p in config.park_positions:
+        print(f'   {p:6s}    {config.park_positions[p]["desc"]}')
+    print()
+    return -1
+
+
 def status(config, _):
     """Reports the current mount status"""
     with config.daemon.connect() as daemon:
@@ -237,12 +256,19 @@ def ping_daemon(config):
         daemon.ping()
 
 
+def list_parks(config, _):
+    """List available park positions for bash command completion"""
+    print(' '.join(sorted(config.park_positions.keys())))
+    return 0
+
+
 def print_usage():
     """Prints the utility help"""
     print(f'usage: {SCRIPT_NAME} <command> \\[<args>]')
     print()
     print('general commands:')
     print('   status    print a human-readable summary of the telescope status')
+    print('   park      park the telescope in a named position')
     print()
     print('observing commands:')
     print('   track     slew the telescope to a given J2000 RA, Dec and track the target')
@@ -262,6 +288,7 @@ if __name__ == '__main__':
     commands = {
         'track': track,
         'slew': slew,
+        'park': park,
         'offset': offset,
         'focus': focus,
         'status': status,
@@ -270,6 +297,7 @@ if __name__ == '__main__':
         'home': home,
         'light': light,
         'kill': shutdown,
+        'list-parks': list_parks
     }
 
     if len(sys.argv) >= 2 and sys.argv[1] in commands:
